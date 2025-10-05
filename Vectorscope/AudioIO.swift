@@ -386,4 +386,10 @@ public final class StereoAudioSource {
         }
         return n
     }
+
+    public var currentSampleRate: Double {
+        indexQueue.sync {
+            currentFormat?.sampleRate ?? desiredSampleRate
+        }
+    }
 }
