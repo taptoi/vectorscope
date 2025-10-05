@@ -5,11 +5,18 @@ import simd
 
 // MARK: - Uniforms (shared with .metal)
 struct VectorscopeUniforms {
-    var gain: Float          // amplitude scale
-    var sampleCount: UInt32  // number of vertices to draw
-    var pointSize: Float     // in pixels
-    var aspectScaleY: Float  // width/height for undistorted aspect
-    var brightness: Float    // alpha for points
+    var viewProjection: simd_float4x4
+    var misc: SIMD4<Float> // x: brightness, y: point size, z: sampleCount, w: unused
+}
+
+struct AudioLiftParams {
+    var sampleCount: UInt32
+    var tauSamples: UInt32
+    var scaleXY: SIMD2<Float>
+    var scaleZ: Float
+    var pad0: Float = 0
+    var offset: SIMD3<Float>
+    var pad1: Float = 0
 }
 
 final class VectorscopeRenderer: NSObject, MTKViewDelegate {
@@ -17,12 +24,15 @@ final class VectorscopeRenderer: NSObject, MTKViewDelegate {
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
     private var pipeline: MTLRenderPipelineState!
+    private var computePipeline: MTLComputePipelineState!
 
     // Buffers (double-buffering to avoid races)
     private let maxSamples: Int
     private var leftBuffers: [MTLBuffer] = []
     private var rightBuffers: [MTLBuffer] = []
     private var uniformsBuffers: [MTLBuffer] = []
+    private var positionsBuffers: [MTLBuffer] = []
+    private var liftParamsBuffers: [MTLBuffer] = []
     private var writeBufferIndex = 0
 
     // State
@@ -30,8 +40,11 @@ final class VectorscopeRenderer: NSObject, MTKViewDelegate {
     var pointSize: Float = 2.0
     var brightness: Float = 0.9
     private(set) var currentSampleCount: Int = 0
-    private var aspectScaleY: Float = 1.0
-    
+    var zGain: Float = 1.0
+    var timeLagMilliseconds: Float = 2.0
+    var liftOffset = SIMD3<Float>(repeating: 0)
+    private var viewProjectionMatrix = matrix_identity_float4x4
+
     // How many recent samples to draw per frame (clamped to maxSamples)
     var samplesToDraw: Int = 16384
 
@@ -70,12 +83,14 @@ final class VectorscopeRenderer: NSObject, MTKViewDelegate {
         view.enableSetNeedsDisplay = false
         view.preferredFramesPerSecond = 60
         view.delegate = self
+        updateViewProjection(for: view.drawableSize)
     }
 
     private func buildPipeline(mtkView: MTKView) {
         let library = try! device.makeDefaultLibrary(bundle: .main)
-        let vfn = library.makeFunction(name: "vectorscope_vertex")!
+        let vfn = library.makeFunction(name: "vectorscope_lift_vertex")!
         let ffn = library.makeFunction(name: "vectorscope_fragment")!
+        let cfn = library.makeFunction(name: "liftStereoTimeLag")!
 
         let desc = MTLRenderPipelineDescriptor()
         desc.vertexFunction = vfn
@@ -91,6 +106,7 @@ final class VectorscopeRenderer: NSObject, MTKViewDelegate {
         desc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
 
         self.pipeline = try! device.makeRenderPipelineState(descriptor: desc)
+        self.computePipeline = try! device.makeComputePipelineState(function: cfn)
     }
 
     private func allocateBuffers() {
@@ -98,26 +114,39 @@ final class VectorscopeRenderer: NSObject, MTKViewDelegate {
             device.makeBuffer(length: byteCount, options: [.storageModeShared])!
         }
         let sampleBytes = maxSamples * MemoryLayout<Float>.stride
+        let positionBytes = maxSamples * MemoryLayout<SIMD3<Float>>.stride
         for _ in 0..<2 {
             leftBuffers.append(makeBuffer(byteCount: sampleBytes))
             rightBuffers.append(makeBuffer(byteCount: sampleBytes))
             uniformsBuffers.append(makeBuffer(byteCount: MemoryLayout<VectorscopeUniforms>.stride))
+            positionsBuffers.append(device.makeBuffer(length: positionBytes, options: [.storageModePrivate])!)
+            liftParamsBuffers.append(makeBuffer(byteCount: MemoryLayout<AudioLiftParams>.stride))
         }
+    }
+
+    private func updateViewProjection(for size: CGSize) {
+        let aspect = size.height > 0 ? Float(size.width / size.height) : 1.0
+        let projection = simd_float4x4.perspective(fovY: .pi / 3, aspect: aspect, nearZ: 0.01, farZ: 20.0)
+        let rotateX = simd_float4x4(rotation: -.pi / 3.2, axis: SIMD3<Float>(1, 0, 0))
+        let rotateZ = simd_float4x4(rotation: .pi / 6, axis: SIMD3<Float>(0, 0, 1))
+        let translate = simd_float4x4(translation: SIMD3<Float>(0, 0, -3.0))
+        viewProjectionMatrix = projection * translate * rotateX * rotateZ
     }
 
     // MARK: - MTKViewDelegate
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
-        // scale Y to keep circles undistorted in non-square viewports
-        aspectScaleY = size.width > 0 ? Float(size.width / size.height) : 1.0
+        updateViewProjection(for: size)
     }
 
     func draw(in view: MTKView) {
         guard let rpd = view.currentRenderPassDescriptor,
               let drawable = view.currentDrawable else { return }
 
+        updateViewProjection(for: view.drawableSize)
+
         // Add debug logging for frame rate analysis
         let currentTime = CACurrentMediaTime()
-        
+
         frameCount += 1
 
         // 1) Pull latest audio samples into the *write* buffers
@@ -125,47 +154,75 @@ final class VectorscopeRenderer: NSObject, MTKViewDelegate {
         let rb = rightBuffers[writeBufferIndex]
         let lPtr = lb.contents().bindMemory(to: Float.self, capacity: maxSamples)
         let rPtr = rb.contents().bindMemory(to: Float.self, capacity: maxSamples)
-        
-        // Draw a larger recent window for denser visuals
+
         let requested = min(maxSamples, max(0, samplesToDraw))
         let got = audio.copyLatest(into: lPtr, rightOut: rPtr, maxOut: requested)
         currentSampleCount = got
         totalSamples += got
-        
+
+        let sampleRate = max(Float(audio.currentSampleRate), 1.0)
+        let tauSamples = UInt32(max(1, Int((timeLagMilliseconds / 1000.0) * sampleRate)))
+
         // Log statistics every second
         if currentTime - lastDrawTime > 1.0 {
             print("=== Vectorscope Debug Stats ===")
             print("Draw calls per second: \(frameCount)")
-            print("Average samples per frame: \(totalSamples / frameCount)")
+            print("Average samples per frame: \(frameCount > 0 ? totalSamples / frameCount : 0)")
             print("Current sample count: \(got)")
-            print("Point size: \(pointSize), Gain: \(gain)")
+            print("Gain XY: \(gain), Gain Z: \(zGain), τ(samples): \(tauSamples)")
             print("===============================")
             frameCount = 0
             totalSamples = 0
             lastDrawTime = currentTime
         }
 
-        // 2) Update uniforms for current frame
-        var u = VectorscopeUniforms(
-            gain: gain,
-            sampleCount: UInt32(got),
-            pointSize: pointSize,
-            aspectScaleY: aspectScaleY,
-            brightness: brightness
-        )
-        let ub = uniformsBuffers[writeBufferIndex]
-        memcpy(ub.contents(), &u, MemoryLayout<VectorscopeUniforms>.stride)
+        // 2) Update lift params + uniforms for current frame
+        let paramsBuffer = liftParamsBuffers[writeBufferIndex]
+        if got > 0 {
+            var params = AudioLiftParams(
+                sampleCount: UInt32(got),
+                tauSamples: tauSamples,
+                scaleXY: SIMD2<Float>(gain, gain),
+                scaleZ: zGain,
+                offset: liftOffset
+            )
+            memcpy(paramsBuffer.contents(), &params, MemoryLayout<AudioLiftParams>.stride)
+        }
 
-        // 3) Encode draw (point list)
+        var uniforms = VectorscopeUniforms(
+            viewProjection: viewProjectionMatrix,
+            misc: SIMD4<Float>(brightness, pointSize, Float(got), 0)
+        )
+        let uniformsBuffer = uniformsBuffers[writeBufferIndex]
+        memcpy(uniformsBuffer.contents(), &uniforms, MemoryLayout<VectorscopeUniforms>.stride)
+
+        // 3) Encode compute + render
         let cb = commandQueue.makeCommandBuffer()!
-        let enc = cb.makeRenderCommandEncoder(descriptor: rpd)!
-        enc.setRenderPipelineState(pipeline)
-        enc.setVertexBuffer(lb, offset: 0, index: 0)  // left channel
-        enc.setVertexBuffer(rb, offset: 0, index: 1)  // right channel
-        enc.setVertexBuffer(ub, offset: 0, index: 2)  // uniforms
 
         if got > 0 {
-            enc.drawPrimitives(type: .point, vertexStart: 0, vertexCount: got)
+            let compute = cb.makeComputeCommandEncoder()!
+            compute.setComputePipelineState(computePipeline)
+            compute.setBuffer(lb, offset: 0, index: 0)
+            compute.setBuffer(rb, offset: 0, index: 1)
+            compute.setBuffer(positionsBuffers[writeBufferIndex], offset: 0, index: 2)
+            compute.setBuffer(paramsBuffer, offset: 0, index: 3)
+
+            let threadWidth = computePipeline.threadExecutionWidth
+            let threadsPerGroup = MTLSize(width: min(threadWidth, max(1, got)), height: 1, depth: 1)
+            let threads = MTLSize(width: got, height: 1, depth: 1)
+            compute.dispatchThreads(threads, threadsPerThreadgroup: threadsPerGroup)
+            compute.endEncoding()
+        }
+
+        let enc = cb.makeRenderCommandEncoder(descriptor: rpd)!
+        enc.setRenderPipelineState(pipeline)
+        enc.setVertexBuffer(positionsBuffers[writeBufferIndex], offset: 0, index: 0)
+        enc.setVertexBuffer(uniformsBuffer, offset: 0, index: 1)
+
+        if got >= 2 {
+            enc.drawPrimitives(type: .lineStrip, vertexStart: 0, vertexCount: got)
+        } else if got == 1 {
+            enc.drawPrimitives(type: .point, vertexStart: 0, vertexCount: 1)
         }
 
         enc.endEncoding()
@@ -203,7 +260,10 @@ public final class VectorscopeMTKView: MTKView {
     // Expose some controls
     public var gain: Float {
         get { renderer?.gain ?? 1.0 }
-        set { renderer?.gain = newValue }
+        set {
+            renderer?.gain = newValue
+            renderer?.zGain = newValue
+        }
     }
 
     public var pointSize: Float {
@@ -219,5 +279,40 @@ public final class VectorscopeMTKView: MTKView {
     public var samplesToDraw: Int {
         get { renderer?.samplesToDraw ?? 16384 }
         set { renderer?.samplesToDraw = newValue }
+    }
+}
+
+private extension simd_float4x4 {
+    static func perspective(fovY: Float, aspect: Float, nearZ: Float, farZ: Float) -> simd_float4x4 {
+        let yScale = 1 / tan(fovY * 0.5)
+        let xScale = yScale / max(aspect, 0.0001)
+        let zRange = farZ - nearZ
+        let zScale = -(farZ + nearZ) / zRange
+        let wz = -2 * farZ * nearZ / zRange
+        return simd_float4x4(columns: (
+            SIMD4<Float>(xScale, 0, 0, 0),
+            SIMD4<Float>(0, yScale, 0, 0),
+            SIMD4<Float>(0, 0, zScale, -1),
+            SIMD4<Float>(0, 0, wz, 0)
+        ))
+    }
+
+    init(rotation angle: Float, axis: SIMD3<Float>) {
+        let a = simd_normalize(axis)
+        let c = cos(angle)
+        let s = sin(angle)
+        let t = 1 - c
+        let x = a.x, y = a.y, z = a.z
+        self.init(columns: (
+            SIMD4<Float>(t * x * x + c,     t * x * y + s * z, t * x * z - s * y, 0),
+            SIMD4<Float>(t * x * y - s * z, t * y * y + c,     t * y * z + s * x, 0),
+            SIMD4<Float>(t * x * z + s * y, t * y * z - s * x, t * z * z + c,     0),
+            SIMD4<Float>(0,                 0,                 0,                 1)
+        ))
+    }
+
+    init(translation t: SIMD3<Float>) {
+        self = matrix_identity_float4x4
+        self.columns.3 = SIMD4<Float>(t.x, t.y, t.z, 1)
     }
 }
