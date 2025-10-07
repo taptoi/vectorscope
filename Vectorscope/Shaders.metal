@@ -289,6 +289,7 @@ fragment float4 line_expand_fragment(FullscreenOut in                 [[stage_in
     float alpha = clamp(mask * uniforms.intensityScale, 0.0, 1.0);
     float3 baseColor = (alphaAccum > 1e-5) ? colorAccum / max(alphaAccum, 1e-5) : float3(0.0);
     float3 finalColor = baseColor * alpha;
+    finalColor = trunc(finalColor) * 1.2;
 
     return float4(finalColor, alpha);
 }
