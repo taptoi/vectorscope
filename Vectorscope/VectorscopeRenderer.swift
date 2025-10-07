@@ -6,7 +6,8 @@ import simd
 // MARK: - Uniforms (shared with .metal)
 struct VectorscopeUniforms {
     var viewProjection: simd_float4x4
-    var misc: SIMD4<Float> // x: brightness, y: point size, z: sampleCount, w: unused
+    var misc: SIMD4<Float> // x: brightness, y: point size, z: transient, w: unused
+    var bands: SIMD4<Float> // xyz: low/mid/high energy, w: time
 }
 
 struct AudioLiftParams {
@@ -19,21 +20,50 @@ struct AudioLiftParams {
     var pad1: Float = 0
 }
 
+struct ParticleUpdateUniforms {
+    var counts: SIMD2<UInt32>
+    var dt_time: SIMD2<Float>
+    var emission_lifetime: SIMD2<Float>
+    var damping_transient: SIMD2<Float>
+    var bandEnergy: SIMD3<Float>
+    var spawnJitter: Float
+    var frameIndex: UInt32
+    var pad: SIMD3<UInt32> = .init(repeating: 0)
+}
+
+struct Particle {
+    var position: SIMD3<Float>
+    var age: Float
+    var velocity: SIMD3<Float>
+    var lifetime: Float
+    var color: SIMD3<Float>
+    var brightness: Float
+}
+
+struct EmitterSample {
+    var position: SIMD3<Float>
+    var power: Float
+}
+
 final class VectorscopeRenderer: NSObject, MTKViewDelegate {
     // GPU
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
     private var pipeline: MTLRenderPipelineState!
-    private var computePipeline: MTLComputePipelineState!
+    private var liftPipeline: MTLComputePipelineState!
+    private var particlePipeline: MTLComputePipelineState!
 
     // Buffers (double-buffering to avoid races)
     private let maxSamples: Int
     private var leftBuffers: [MTLBuffer] = []
     private var rightBuffers: [MTLBuffer] = []
     private var uniformsBuffers: [MTLBuffer] = []
-    private var positionsBuffers: [MTLBuffer] = []
+    private var emitterBuffers: [MTLBuffer] = []
     private var liftParamsBuffers: [MTLBuffer] = []
+    private var particleBuffers: [MTLBuffer] = []
+    private var particleUniformBuffers: [MTLBuffer] = []
     private var writeBufferIndex = 0
+    private var particleBufferIndex = 0
 
     // State
     var gain: Float = 1.0
@@ -44,12 +74,23 @@ final class VectorscopeRenderer: NSObject, MTKViewDelegate {
     var timeLagMilliseconds: Float = 2.0
     var liftOffset = SIMD3<Float>(repeating: 0)
     private var viewProjectionMatrix = matrix_identity_float4x4
+    var emissionRate: Float = 48.0
+    var particleLifetime: Float = 2.4
+    var dampingFactor: Float = 0.28
 
     // How many recent samples to draw per frame (clamped to maxSamples)
     var samplesToDraw: Int = 16384
 
     // Audio
     private let audio: StereoAudioSource
+
+    // Particle state
+    private let maxParticles: Int
+    private var bandEnergyState = SIMD3<Float>(repeating: 0)
+    private var previousMeanPower: Float = 0
+    private var accumulatedTime: Float = 0
+    private var frameCounter: UInt32 = 0
+    private var lastFrameTimestamp: CFTimeInterval = 0
     
     // Debug logging properties
     private var lastDrawTime: CFTimeInterval = 0
@@ -65,6 +106,7 @@ final class VectorscopeRenderer: NSObject, MTKViewDelegate {
         self.commandQueue = dev.makeCommandQueue()!
         self.audio = audio
         self.maxSamples = maxSamples
+        self.maxParticles = min(max(maxSamples * 2, 32768), 262144)
 
         super.init()
 
@@ -90,7 +132,8 @@ final class VectorscopeRenderer: NSObject, MTKViewDelegate {
         let library = try! device.makeDefaultLibrary(bundle: .main)
         let vfn = library.makeFunction(name: "vectorscope_lift_vertex")!
         let ffn = library.makeFunction(name: "vectorscope_fragment")!
-        let cfn = library.makeFunction(name: "liftStereoTimeLag")!
+        let liftFn = library.makeFunction(name: "liftStereoTimeLag")!
+        let particleFn = library.makeFunction(name: "updateParticles")!
 
         let desc = MTLRenderPipelineDescriptor()
         desc.vertexFunction = vfn
@@ -106,7 +149,8 @@ final class VectorscopeRenderer: NSObject, MTKViewDelegate {
         desc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
 
         self.pipeline = try! device.makeRenderPipelineState(descriptor: desc)
-        self.computePipeline = try! device.makeComputePipelineState(function: cfn)
+        self.liftPipeline = try! device.makeComputePipelineState(function: liftFn)
+        self.particlePipeline = try! device.makeComputePipelineState(function: particleFn)
     }
 
     private func allocateBuffers() {
@@ -114,13 +158,32 @@ final class VectorscopeRenderer: NSObject, MTKViewDelegate {
             device.makeBuffer(length: byteCount, options: [.storageModeShared])!
         }
         let sampleBytes = maxSamples * MemoryLayout<Float>.stride
-        let positionBytes = maxSamples * MemoryLayout<SIMD3<Float>>.stride
+        let emitterBytes = maxSamples * MemoryLayout<EmitterSample>.stride
+        let particleBytes = maxParticles * MemoryLayout<Particle>.stride
         for _ in 0..<2 {
             leftBuffers.append(makeBuffer(byteCount: sampleBytes))
             rightBuffers.append(makeBuffer(byteCount: sampleBytes))
             uniformsBuffers.append(makeBuffer(byteCount: MemoryLayout<VectorscopeUniforms>.stride))
-            positionsBuffers.append(device.makeBuffer(length: positionBytes, options: [.storageModePrivate])!)
+            emitterBuffers.append(device.makeBuffer(length: emitterBytes, options: [.storageModePrivate])!)
             liftParamsBuffers.append(makeBuffer(byteCount: MemoryLayout<AudioLiftParams>.stride))
+            particleUniformBuffers.append(makeBuffer(byteCount: MemoryLayout<ParticleUpdateUniforms>.stride))
+        }
+
+        for _ in 0..<2 {
+            let buffer = device.makeBuffer(length: particleBytes, options: [.storageModeShared])!
+            particleBuffers.append(buffer)
+        }
+
+        for buffer in particleBuffers {
+            let ptr = buffer.contents().bindMemory(to: Particle.self, capacity: maxParticles)
+            for i in 0..<maxParticles {
+                ptr[i] = Particle(position: .zero,
+                                   age: Float.greatestFiniteMagnitude,
+                                   velocity: .zero,
+                                   lifetime: 1.0,
+                                   color: SIMD3<Float>(repeating: 0),
+                                   brightness: 0)
+            }
         }
     }
 
@@ -144,8 +207,16 @@ final class VectorscopeRenderer: NSObject, MTKViewDelegate {
 
         updateViewProjection(for: view.drawableSize)
 
-        // Add debug logging for frame rate analysis
         let currentTime = CACurrentMediaTime()
+        let dt: Float
+        if lastFrameTimestamp == 0 {
+            let fps = view.preferredFramesPerSecond > 0 ? view.preferredFramesPerSecond : 60
+            dt = 1.0 / Float(fps)
+        } else {
+            dt = Float(currentTime - lastFrameTimestamp)
+        }
+        lastFrameTimestamp = currentTime
+        accumulatedTime += dt
 
         frameCount += 1
 
@@ -189,41 +260,110 @@ final class VectorscopeRenderer: NSObject, MTKViewDelegate {
             memcpy(paramsBuffer.contents(), &params, MemoryLayout<AudioLiftParams>.stride)
         }
 
+        var low = bandEnergyState.x * 0.96
+        var mid = bandEnergyState.y * 0.96
+        var high = bandEnergyState.z * 0.96
+        var transientValue: Float = 0
+
+        if got > 0 {
+            var powerAccum: Float = 0
+            for i in 0..<got {
+                let l = lPtr[i]
+                let r = rPtr[i]
+                let sample = 0.5 * (l + r)
+                let amplitude = sqrt(l * l + r * r)
+                powerAccum += amplitude
+
+                let absSample = abs(sample)
+                low += (absSample - low) * 0.025
+                let midComponent = abs(sample - low)
+                mid += (midComponent - mid) * 0.06
+                let highComponent = abs(sample - (low + midComponent * 0.5))
+                high += (highComponent - high) * 0.1
+            }
+
+            bandEnergyState = SIMD3<Float>(low, mid, high)
+
+            let meanPower = powerAccum / Float(got)
+            transientValue = max(0, meanPower - previousMeanPower * 0.85)
+            previousMeanPower = previousMeanPower * 0.6 + meanPower * 0.4
+        } else {
+            bandEnergyState = SIMD3<Float>(low, mid, high)
+            previousMeanPower *= 0.94
+        }
+
+        let normalizedBands = simd_clamp(bandEnergyState * 12.0,
+                                          SIMD3<Float>(repeating: 0),
+                                          SIMD3<Float>(repeating: 3.0))
+        let transientNormalized = min(max(transientValue * 12.0, 0), 3.0)
+
+        let emissionSpeed = max(4.0, emissionRate * (0.4 + normalizedBands.y * 0.5))
+        let lifetime = max(0.4, particleLifetime * (0.7 + normalizedBands.x * 0.4))
+        let spawnJitter = 0.5 + normalizedBands.z * 0.4
+
         var uniforms = VectorscopeUniforms(
             viewProjection: viewProjectionMatrix,
-            misc: SIMD4<Float>(brightness, pointSize, Float(got), 0)
+            misc: SIMD4<Float>(brightness, pointSize, transientNormalized, 0),
+            bands: SIMD4<Float>(normalizedBands.x, normalizedBands.y, normalizedBands.z, accumulatedTime)
         )
         let uniformsBuffer = uniformsBuffers[writeBufferIndex]
         memcpy(uniformsBuffer.contents(), &uniforms, MemoryLayout<VectorscopeUniforms>.stride)
+
+        let particleUniformsBuffer = particleUniformBuffers[writeBufferIndex]
+        let frameIndex = frameCounter
+        frameCounter &+= 1
+        var particleUniforms = ParticleUpdateUniforms(
+            counts: SIMD2<UInt32>(UInt32(got), UInt32(maxParticles)),
+            dt_time: SIMD2<Float>(dt, accumulatedTime),
+            emission_lifetime: SIMD2<Float>(emissionSpeed, lifetime),
+            damping_transient: SIMD2<Float>(dampingFactor, transientNormalized),
+            bandEnergy: normalizedBands,
+            spawnJitter: spawnJitter,
+            frameIndex: frameIndex,
+            pad: .init(repeating: 0)
+        )
+        memcpy(particleUniformsBuffer.contents(), &particleUniforms, MemoryLayout<ParticleUpdateUniforms>.stride)
 
         // 3) Encode compute + render
         let cb = commandQueue.makeCommandBuffer()!
 
         if got > 0 {
             let compute = cb.makeComputeCommandEncoder()!
-            compute.setComputePipelineState(computePipeline)
+            compute.setComputePipelineState(liftPipeline)
             compute.setBuffer(lb, offset: 0, index: 0)
             compute.setBuffer(rb, offset: 0, index: 1)
-            compute.setBuffer(positionsBuffers[writeBufferIndex], offset: 0, index: 2)
+            compute.setBuffer(emitterBuffers[writeBufferIndex], offset: 0, index: 2)
             compute.setBuffer(paramsBuffer, offset: 0, index: 3)
 
-            let threadWidth = computePipeline.threadExecutionWidth
+            let threadWidth = liftPipeline.threadExecutionWidth
             let threadsPerGroup = MTLSize(width: min(threadWidth, max(1, got)), height: 1, depth: 1)
             let threads = MTLSize(width: got, height: 1, depth: 1)
             compute.dispatchThreads(threads, threadsPerThreadgroup: threadsPerGroup)
             compute.endEncoding()
         }
 
+        let readIndex = particleBufferIndex
+        let writeIndex = 1 - particleBufferIndex
+
+        let particleCompute = cb.makeComputeCommandEncoder()!
+        particleCompute.setComputePipelineState(particlePipeline)
+        particleCompute.setBuffer(particleBuffers[readIndex], offset: 0, index: 0)
+        particleCompute.setBuffer(particleBuffers[writeIndex], offset: 0, index: 1)
+        particleCompute.setBuffer(emitterBuffers[writeBufferIndex], offset: 0, index: 2)
+        particleCompute.setBuffer(particleUniformsBuffer, offset: 0, index: 3)
+
+        let particleThreadWidth = particlePipeline.threadExecutionWidth
+        let particlesPerGroup = MTLSize(width: min(particleThreadWidth, maxParticles), height: 1, depth: 1)
+        let particleThreads = MTLSize(width: maxParticles, height: 1, depth: 1)
+        particleCompute.dispatchThreads(particleThreads, threadsPerThreadgroup: particlesPerGroup)
+        particleCompute.endEncoding()
+
         let enc = cb.makeRenderCommandEncoder(descriptor: rpd)!
         enc.setRenderPipelineState(pipeline)
-        enc.setVertexBuffer(positionsBuffers[writeBufferIndex], offset: 0, index: 0)
+        enc.setVertexBuffer(particleBuffers[writeIndex], offset: 0, index: 0)
         enc.setVertexBuffer(uniformsBuffer, offset: 0, index: 1)
 
-        if got >= 2 {
-            enc.drawPrimitives(type: .lineStrip, vertexStart: 0, vertexCount: got)
-        } else if got == 1 {
-            enc.drawPrimitives(type: .point, vertexStart: 0, vertexCount: 1)
-        }
+        enc.drawPrimitives(type: .point, vertexStart: 0, vertexCount: maxParticles)
 
         enc.endEncoding()
         cb.present(drawable)
@@ -231,6 +371,7 @@ final class VectorscopeRenderer: NSObject, MTKViewDelegate {
 
         // 4) Swap write buffer for next frame
         writeBufferIndex = 1 - writeBufferIndex
+        particleBufferIndex = writeIndex
     }
 }
 
