@@ -199,8 +199,14 @@ vertex VSOut vectorscope_lift_vertex(uint vid [[vertex_id]],
 
     float total = max(1.0, uniforms.misc.z - 1.0);
     float age = (total > 0.0) ? float(vid) / total : 0.0;
-    float4 p_in = float4(p, total);
-    float4 perlin = perlinNoise4(p_in) * 2.;
+    float evolve = uniforms.misc.w * 0.002f;
+    float4 p_in = float4(
+        p.x + evolve,
+        p.y - evolve * 0.35f,
+        p.z * 0.7f + evolve * 0.18f,
+        total * 0.01f + evolve * 0.11f
+    );
+    float4 perlin = perlinNoise4(p_in) * 2.0f;
     float4 out_pos = uniforms.viewProjection * float4(perlin.xyz, 1.0);
     // shift if out of bounds:
     // out_pos = fract(out_pos) - float4(0.5);
