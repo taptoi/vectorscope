@@ -67,10 +67,10 @@ struct ContentView: View {
     #if os(macOS)
     @State private var source: VectorscopeView.Source = .microphone
     #endif
-    @State private var gain: Float = 1.2
+    @State private var gain: Float = 1.6
     @State private var pointSize: Float = 2.0
-    @State private var brightness: Float = 0.9
-    @State private var samplesToDraw: Int = 262144
+    @State private var brightness: Float = 0.3
+    @State private var samplesToDraw: Int = 180000
 
     var body: some View {
         VStack(spacing: 8) {
@@ -96,7 +96,7 @@ struct ContentView: View {
                 }
                 HStack(spacing: 6) {
                     Text("Samples").font(.caption)
-                    Slider(value: Binding(get: { Double(samplesToDraw) }, set: { samplesToDraw = Int($0) }), in: 1024...131072)
+                    Slider(value: Binding(get: { Double(samplesToDraw) }, set: { samplesToDraw = Int($0) }), in: 1024...262144)
                         .frame(width: 200)
                 }
             }

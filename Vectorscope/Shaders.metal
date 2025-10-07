@@ -152,6 +152,12 @@ struct LiftRenderUniforms {
     float4   misc; // x: brightness, y: point size, z: sample count, w: frame
 };
 
+struct LineExpandUniforms {
+    float2 texelSize;
+    float  lineWidth;
+    float  intensityScale;
+};
+
 struct VSOut {
     float4 position [[position]];
     float4 color;
@@ -206,10 +212,10 @@ vertex VSOut vectorscope_lift_vertex(uint vid [[vertex_id]],
         p.z * 0.7f + evolve * 0.18f,
         total * 0.01f + evolve * 0.11f
     );
-    float4 perlin = perlinNoise4(p_in) * 2.0f;
-    float4 out_pos = uniforms.viewProjection * float4(perlin.xyz, 1.0);
+    float4 perlin = perlinNoise4(p_in) * 4.0f;
+    float4 out_pos = uniforms.viewProjection * float4(perlin.xyz, 4.0);
     // shift if out of bounds:
-    // out_pos = fract(out_pos) - float4(0.5);
+    out_pos = fract(out_pos) - float4(0.5);
     float4 minB = float4(-10.0, -10.0, -100.0, -100.0);
     float4 maxB = float4( 10.0,  10.0,  100.0, 100.0);
     out.position = wrapPosition(out_pos, minB, maxB);
@@ -229,4 +235,60 @@ vertex VSOut vectorscope_lift_vertex(uint vid [[vertex_id]],
 
 fragment float4 vectorscope_fragment(VSOut in [[stage_in]]) {
     return in.color * 1.3;
+}
+
+struct FullscreenOut {
+    float4 position [[position]];
+    float2 uv;
+};
+
+vertex FullscreenOut line_expand_vertex(uint vid [[vertex_id]]) {
+    float2 pos = float2((vid & 1) ? 1.0 : -1.0,
+                        (vid & 2) ? 1.0 : -1.0);
+    FullscreenOut out;
+    out.position = float4(pos, 0.0, 1.0);
+    out.uv = pos * 0.5 + 0.5;
+    return out;
+}
+
+fragment float4 line_expand_fragment(FullscreenOut in                 [[stage_in]],
+                                     texture2d<float> lineTexture      [[texture(0)]],
+                                     constant LineExpandUniforms& uniforms [[buffer(0)]]) {
+    constexpr sampler linearSampler(address::clamp_to_edge, filter::linear);
+
+    float2 offsets[9] = {
+        float2(-1.0, -1.0), float2(0.0, -1.0), float2(1.0, -1.0),
+        float2(-1.0,  0.0), float2(0.0,  0.0), float2(1.0,  0.0),
+        float2(-1.0,  1.0), float2(0.0,  1.0), float2(1.0,  1.0)
+    };
+
+    float weights[9] = {
+        1.0/16.0, 2.0/16.0, 1.0/16.0,
+        2.0/16.0, 4.0/16.0, 2.0/16.0,
+        1.0/16.0, 2.0/16.0, 1.0/16.0
+    };
+
+    float3 colorAccum = float3(0.0);
+    float  alphaAccum = 0.0;
+
+    for (uint i = 0; i < 9; ++i) {
+        float2 sampleUV = in.uv + offsets[i] * uniforms.texelSize;
+        float4 s = lineTexture.sample(linearSampler, sampleUV);
+        colorAccum += s.rgb * weights[i];
+        alphaAccum += s.a * weights[i];
+    }
+
+    float width = max(uniforms.lineWidth, 0.01);
+    float coreThreshold = clamp(0.35 / width, 0.02, 0.95);
+    float featherThreshold = coreThreshold * 0.5;
+
+    float hardMask = step(coreThreshold, alphaAccum);
+    float softMask = smoothstep(featherThreshold, coreThreshold, alphaAccum);
+    float mask = max(hardMask, softMask);
+
+    float alpha = clamp(mask * uniforms.intensityScale, 0.0, 1.0);
+    float3 baseColor = (alphaAccum > 1e-5) ? colorAccum / max(alphaAccum, 1e-5) : float3(0.0);
+    float3 finalColor = baseColor * alpha;
+
+    return float4(finalColor, alpha);
 }

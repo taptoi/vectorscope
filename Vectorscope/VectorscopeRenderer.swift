@@ -19,12 +19,19 @@ struct AudioLiftParams {
     var pad1: Float = 0
 }
 
+struct LineExpandUniforms {
+    var texelSize: SIMD2<Float>
+    var lineWidth: Float
+    var intensityScale: Float
+}
+
 final class VectorscopeRenderer: NSObject, MTKViewDelegate {
     // GPU
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
     private var pipeline: MTLRenderPipelineState!
     private var computePipeline: MTLComputePipelineState!
+    private var postPipeline: MTLRenderPipelineState!
 
     // Buffers (double-buffering to avoid races)
     private let maxSamples: Int
@@ -33,6 +40,7 @@ final class VectorscopeRenderer: NSObject, MTKViewDelegate {
     private var uniformsBuffers: [MTLBuffer] = []
     private var positionsBuffers: [MTLBuffer] = []
     private var liftParamsBuffers: [MTLBuffer] = []
+    private var postUniformBuffers: [MTLBuffer] = []
     private var writeBufferIndex = 0
 
     // State
@@ -44,6 +52,7 @@ final class VectorscopeRenderer: NSObject, MTKViewDelegate {
     var timeLagMilliseconds: Float = 2.0
     var liftOffset = SIMD3<Float>(repeating: 0)
     private var viewProjectionMatrix = matrix_identity_float4x4
+    private var lineTexture: MTLTexture?
 
     // How many recent samples to draw per frame (clamped to maxSamples)
     var samplesToDraw: Int = 16384
@@ -84,6 +93,7 @@ final class VectorscopeRenderer: NSObject, MTKViewDelegate {
         view.preferredFramesPerSecond = 60
         view.delegate = self
         updateViewProjection(for: view.drawableSize)
+        ensureLineTexture(for: view.drawableSize)
     }
 
     private func buildPipeline(mtkView: MTKView) {
@@ -91,6 +101,8 @@ final class VectorscopeRenderer: NSObject, MTKViewDelegate {
         let vfn = library.makeFunction(name: "vectorscope_lift_vertex")!
         let ffn = library.makeFunction(name: "vectorscope_fragment")!
         let cfn = library.makeFunction(name: "liftStereoTimeLag")!
+        let postVfn = library.makeFunction(name: "line_expand_vertex")!
+        let postFfn = library.makeFunction(name: "line_expand_fragment")!
 
         let desc = MTLRenderPipelineDescriptor()
         desc.vertexFunction = vfn
@@ -107,6 +119,13 @@ final class VectorscopeRenderer: NSObject, MTKViewDelegate {
 
         self.pipeline = try! device.makeRenderPipelineState(descriptor: desc)
         self.computePipeline = try! device.makeComputePipelineState(function: cfn)
+
+        let postDesc = MTLRenderPipelineDescriptor()
+        postDesc.vertexFunction = postVfn
+        postDesc.fragmentFunction = postFfn
+        postDesc.colorAttachments[0].pixelFormat = mtkView.colorPixelFormat
+        postDesc.colorAttachments[0].isBlendingEnabled = false
+        self.postPipeline = try! device.makeRenderPipelineState(descriptor: postDesc)
     }
 
     private func allocateBuffers() {
@@ -121,6 +140,7 @@ final class VectorscopeRenderer: NSObject, MTKViewDelegate {
             uniformsBuffers.append(makeBuffer(byteCount: MemoryLayout<VectorscopeUniforms>.stride))
             positionsBuffers.append(device.makeBuffer(length: positionBytes, options: [.storageModePrivate])!)
             liftParamsBuffers.append(makeBuffer(byteCount: MemoryLayout<AudioLiftParams>.stride))
+            postUniformBuffers.append(makeBuffer(byteCount: MemoryLayout<LineExpandUniforms>.stride))
         }
     }
 
@@ -133,9 +153,31 @@ final class VectorscopeRenderer: NSObject, MTKViewDelegate {
         viewProjectionMatrix = projection * translate * rotateX * rotateZ
     }
 
+    private func ensureLineTexture(for size: CGSize) {
+        let width = max(Int(size.width), 1)
+        let height = max(Int(size.height), 1)
+        guard width > 0 && height > 0 else {
+            lineTexture = nil
+            return
+        }
+
+        if let tex = lineTexture, tex.width == width && tex.height == height {
+            return
+        }
+
+        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm,
+                                                            width: width,
+                                                            height: height,
+                                                            mipmapped: false)
+        desc.usage = [.renderTarget, .shaderRead]
+        desc.storageMode = .private
+        lineTexture = device.makeTexture(descriptor: desc)
+    }
+
     // MARK: - MTKViewDelegate
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
         updateViewProjection(for: size)
+        ensureLineTexture(for: size)
     }
 
     func draw(in view: MTKView) {
@@ -143,6 +185,8 @@ final class VectorscopeRenderer: NSObject, MTKViewDelegate {
               let drawable = view.currentDrawable else { return }
 
         updateViewProjection(for: view.drawableSize)
+        ensureLineTexture(for: view.drawableSize)
+        guard let lineTexture = lineTexture else { return }
 
         // Add debug logging for frame rate analysis
         let currentTime = CACurrentMediaTime()
@@ -214,18 +258,42 @@ final class VectorscopeRenderer: NSObject, MTKViewDelegate {
             compute.endEncoding()
         }
 
-        let enc = cb.makeRenderCommandEncoder(descriptor: rpd)!
-        enc.setRenderPipelineState(pipeline)
-        enc.setVertexBuffer(positionsBuffers[writeBufferIndex], offset: 0, index: 0)
-        enc.setVertexBuffer(uniformsBuffer, offset: 0, index: 1)
+        let offscreenPass = MTLRenderPassDescriptor()
+        offscreenPass.colorAttachments[0].texture = lineTexture
+        offscreenPass.colorAttachments[0].loadAction = .clear
+        offscreenPass.colorAttachments[0].storeAction = .store
+        offscreenPass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
 
-        if got >= 2 {
-            enc.drawPrimitives(type: .lineStrip, vertexStart: 0, vertexCount: got)
-        } else if got == 1 {
-            enc.drawPrimitives(type: .point, vertexStart: 0, vertexCount: 1)
+        if let lineEncoder = cb.makeRenderCommandEncoder(descriptor: offscreenPass) {
+            lineEncoder.setRenderPipelineState(pipeline)
+            lineEncoder.setVertexBuffer(positionsBuffers[writeBufferIndex], offset: 0, index: 0)
+            lineEncoder.setVertexBuffer(uniformsBuffer, offset: 0, index: 1)
+
+            if got >= 2 {
+                lineEncoder.drawPrimitives(type: .lineStrip, vertexStart: 0, vertexCount: got)
+            } else if got == 1 {
+                lineEncoder.drawPrimitives(type: .point, vertexStart: 0, vertexCount: 1)
+            }
+
+            lineEncoder.endEncoding()
         }
 
-        enc.endEncoding()
+        var postUniforms = LineExpandUniforms(
+            texelSize: SIMD2<Float>(1.0 / max(Float(lineTexture.width), 1.0),
+                                    1.0 / max(Float(lineTexture.height), 1.0)),
+            lineWidth: max(pointSize, 0.1),
+            intensityScale: brightness
+        )
+        memcpy(postUniformBuffers[writeBufferIndex].contents(), &postUniforms, MemoryLayout<LineExpandUniforms>.stride)
+
+        if let postEncoder = cb.makeRenderCommandEncoder(descriptor: rpd) {
+            postEncoder.setRenderPipelineState(postPipeline)
+            postEncoder.setFragmentTexture(lineTexture, index: 0)
+            postEncoder.setFragmentBuffer(postUniformBuffers[writeBufferIndex], offset: 0, index: 0)
+            postEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+            postEncoder.endEncoding()
+        }
+
         cb.present(drawable)
         cb.commit()
 
