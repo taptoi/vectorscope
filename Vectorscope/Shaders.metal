@@ -9,6 +9,14 @@ inline float fade(float t) {
 
 inline float lerp(float a, float b, float t) { return a + t * (b - a); }
 
+inline float2 safeNormalize(float2 v) {
+    float len = length(v);
+    if (!isfinite(len) || len < 1e-5f) {
+        return float2(0.0f, 1.0f);
+    }
+    return v / len;
+}
+
 // Simple 32-bit FNV-1a style hash (good enough for gradient selection)
 inline uint hash_u32(uint x) {
     uint h = 2166136261u;
@@ -149,7 +157,8 @@ struct AudioLiftParams {
 
 struct LiftRenderUniforms {
     float4x4 viewProjection;
-    float4   misc; // x: brightness, y: point size, z: sample count, w: unused
+    float4   misc;   // x: brightness, y: line width, z: sample count, w: unused
+    float4   screen; // xy: drawable size, zw: unused
 };
 
 struct VSOut {
@@ -184,19 +193,64 @@ vertex VSOut vectorscope_lift_vertex(uint vid [[vertex_id]],
                                      const device float3* positions [[buffer(0)]],
                                      constant LiftRenderUniforms& uniforms [[buffer(1)]]) {
     VSOut out;
-    float3 p = positions[vid];
-    
-    
+    uint sampleCount = uint(uniforms.misc.z);
+    if (sampleCount == 0) {
+        out.position = float4(0.0, 0.0, 0.0, 1.0);
+        out.color = float4(0.0);
+        out.pointSize = max(1.0, uniforms.misc.y);
+        return out;
+    }
+    uint idx = min(vid / 2, sampleCount - 1);
+    uint side = vid & 1u;
 
-    float total = max(1.0, uniforms.misc.z - 1.0);
-    float age = (total > 0.0) ? float(vid) / total : 0.0;
-    float4 p_in = float4(p, total);
-    float4 perlin = perlinNoise4(p_in) * 10.;
-    float4 out_pos = uniforms.viewProjection * float4(perlin.xyz, 1.0);
-    // shift if out of bounds:
-    out_pos = fract(out_pos) - float4(0.5);
+    float3 p = positions[idx];
+    float3 prevP = positions[(idx > 0) ? (idx - 1) : idx];
+    float3 nextP = positions[(idx + 1 < sampleCount) ? (idx + 1) : idx];
+
+    float4 clipPrev = uniforms.viewProjection * float4(prevP, 1.0);
+    float4 clipCurr = uniforms.viewProjection * float4(p, 1.0);
+    float4 clipNext = uniforms.viewProjection * float4(nextP, 1.0);
+
+    float2 prevNDC = clipPrev.xy / clipPrev.w;
+    float2 currNDC = clipCurr.xy / clipCurr.w;
+    float2 nextNDC = clipNext.xy / clipNext.w;
+
+    bool drawAsLine = sampleCount > 1;
+    float4 out_pos = clipCurr;
+
+    if (drawAsLine) {
+        float2 dir;
+        if (idx == 0) {
+            dir = safeNormalize(nextNDC - currNDC);
+        } else if (idx == sampleCount - 1) {
+            dir = safeNormalize(currNDC - prevNDC);
+        } else {
+            float2 dirA = safeNormalize(currNDC - prevNDC);
+            float2 dirB = safeNormalize(nextNDC - currNDC);
+            dir = safeNormalize(dirA + dirB);
+        }
+
+        float2 normal = float2(-dir.y, dir.x);
+        if (!isfinite(normal.x) || !isfinite(normal.y) || dot(normal, normal) < 1e-6f) {
+            normal = float2(0.0, 1.0);
+        }
+
+        float halfWidth = max(1.0, uniforms.misc.y) * 0.5;
+        float2 screenSize = float2(max(uniforms.screen.x, 1.0), max(uniforms.screen.y, 1.0));
+        float2 pixelToNDC = float2(2.0) / screenSize;
+        float2 offsetNDC = normal * halfWidth * pixelToNDC;
+        if (side == 0) {
+            offsetNDC = -offsetNDC;
+        }
+
+        float2 finalNDC = currNDC + offsetNDC;
+        out_pos.xy = finalNDC * clipCurr.w;
+    }
+
+    float total = max(1.0, float(sampleCount) - 1.0);
+    float age = (sampleCount > 1 && total > 0.0) ? float(idx) / total : 0.0;
     out.position = out_pos;
-    
+
     float alpha = clamp(uniforms.misc.x * age, 0.0, 1.0);
 
     float depth = clamp(0.5 + 0.5 * tanh(p.z), 0.0, 1.0);
