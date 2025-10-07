@@ -6,7 +6,9 @@ import simd
 // MARK: - Uniforms (shared with .metal)
 struct VectorscopeUniforms {
     var viewProjection: simd_float4x4
-    var misc: SIMD4<Float> // x: brightness, y: point size, z: sampleCount, w: unused
+    var misc: SIMD4<Float> // x: brightness, y: line width, z: sampleCount, w: render mode flag
+    var viewportSize: SIMD2<Float>
+    var padding: SIMD2<Float> = .zero
 }
 
 struct AudioLiftParams {
@@ -37,7 +39,11 @@ final class VectorscopeRenderer: NSObject, MTKViewDelegate {
 
     // State
     var gain: Float = 1.0
-    var pointSize: Float = 2.0
+    var pointSize: Float {
+        get { lineWidth }
+        set { lineWidth = newValue }
+    }
+    var lineWidth: Float = 2.0
     var brightness: Float = 0.9
     private(set) var currentSampleCount: Int = 0
     var zGain: Float = 1.0
@@ -96,6 +102,7 @@ final class VectorscopeRenderer: NSObject, MTKViewDelegate {
         desc.vertexFunction = vfn
         desc.fragmentFunction = ffn
         desc.colorAttachments[0].pixelFormat = mtkView.colorPixelFormat
+        desc.inputPrimitiveTopology = .triangle
         // Optional: slightly additive look
         desc.colorAttachments[0].isBlendingEnabled = true
         desc.colorAttachments[0].rgbBlendOperation = .add
@@ -191,7 +198,8 @@ final class VectorscopeRenderer: NSObject, MTKViewDelegate {
 
         var uniforms = VectorscopeUniforms(
             viewProjection: viewProjectionMatrix,
-            misc: SIMD4<Float>(brightness, pointSize, Float(got), 0)
+            misc: SIMD4<Float>(brightness, lineWidth, Float(got), got >= 2 ? 1 : 0),
+            viewportSize: SIMD2<Float>(Float(view.drawableSize.width), Float(view.drawableSize.height))
         )
         let uniformsBuffer = uniformsBuffers[writeBufferIndex]
         memcpy(uniformsBuffer.contents(), &uniforms, MemoryLayout<VectorscopeUniforms>.stride)
@@ -218,9 +226,10 @@ final class VectorscopeRenderer: NSObject, MTKViewDelegate {
         enc.setRenderPipelineState(pipeline)
         enc.setVertexBuffer(positionsBuffers[writeBufferIndex], offset: 0, index: 0)
         enc.setVertexBuffer(uniformsBuffer, offset: 0, index: 1)
+        enc.setCullMode(.none)
 
         if got >= 2 {
-            enc.drawPrimitives(type: .lineStrip, vertexStart: 0, vertexCount: got)
+            enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: got * 2)
         } else if got == 1 {
             enc.drawPrimitives(type: .point, vertexStart: 0, vertexCount: 1)
         }
