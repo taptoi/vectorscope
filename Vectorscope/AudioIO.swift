@@ -102,7 +102,7 @@ public final class StereoAudioSource {
 
     // Public settings
     public var desiredSampleRate: Double = 48000.0  // Default, overridden by hardware
-    public var maxSamplesInRing: Int = 65536  // Much larger ring buffer for proper cycling
+    public var maxSamplesInRing: Int = 262144  // Much larger ring buffer for proper cycling
 
     // Ring buffers (interleaving avoided for simplicity)
     private var leftRing: [Float]
@@ -130,7 +130,7 @@ public final class StereoAudioSource {
     private var lastAudioLogTime: CFTimeInterval = 0
     private var totalFramesProcessed = 0
 
-    public init(maxSamples: Int = 65536) {
+    public init(maxSamples: Int = 262144) {
         self.maxSamplesInRing = max(2048, maxSamples)  // minimum safety
         self.leftRing = Array(repeating: 0, count: self.maxSamplesInRing)
         self.rightRing = Array(repeating: 0, count: self.maxSamplesInRing)

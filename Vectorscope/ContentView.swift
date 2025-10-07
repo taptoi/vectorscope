@@ -70,7 +70,7 @@ struct ContentView: View {
     @State private var gain: Float = 1.2
     @State private var pointSize: Float = 2.0
     @State private var brightness: Float = 0.9
-    @State private var samplesToDraw: Int = 65536
+    @State private var samplesToDraw: Int = 262144
 
     var body: some View {
         VStack(spacing: 8) {
@@ -81,7 +81,7 @@ struct ContentView: View {
                 Spacer()
                 HStack(spacing: 6) {
                     Text("Gain").font(.caption)
-                    Slider(value: Binding(get: { Double(gain) }, set: { gain = Float($0) }), in: 0.1...20.0)
+                    Slider(value: Binding(get: { Double(gain) }, set: { gain = Float($0) }), in: 0.1...100.0)
                         .frame(width: 140)
                 }
                 HStack(spacing: 6) {

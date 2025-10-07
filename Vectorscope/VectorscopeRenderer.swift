@@ -127,9 +127,9 @@ final class VectorscopeRenderer: NSObject, MTKViewDelegate {
     private func updateViewProjection(for size: CGSize) {
         let aspect = size.height > 0 ? Float(size.width / size.height) : 1.0
         let projection = simd_float4x4.perspective(fovY: .pi / 3, aspect: aspect, nearZ: 0.01, farZ: 20.0)
-        let rotateX = simd_float4x4(rotation: -.pi / 3.2, axis: SIMD3<Float>(1, 0, 0))
-        let rotateZ = simd_float4x4(rotation: .pi / 6, axis: SIMD3<Float>(0, 0, 1))
-        let translate = simd_float4x4(translation: SIMD3<Float>(0, 0, -3.0))
+        let rotateX = simd_float4x4(rotation: -.pi / 3.2, axis: SIMD3<Float>(1, 0, 0), frame: frameCount)
+        let rotateZ = simd_float4x4(rotation: .pi / 6, axis: SIMD3<Float>(0, 0, 1), frame: frameCount)
+        let translate = simd_float4x4(translation: SIMD3<Float>(0, 0, -3.0), frame: frameCount)
         viewProjectionMatrix = projection * translate * rotateX * rotateZ
     }
 
@@ -171,7 +171,6 @@ final class VectorscopeRenderer: NSObject, MTKViewDelegate {
             print("Current sample count: \(got)")
             print("Gain XY: \(gain), Gain Z: \(zGain), τ(samples): \(tauSamples)")
             print("===============================")
-            frameCount = 0
             totalSamples = 0
             lastDrawTime = currentTime
         }
@@ -191,7 +190,7 @@ final class VectorscopeRenderer: NSObject, MTKViewDelegate {
 
         var uniforms = VectorscopeUniforms(
             viewProjection: viewProjectionMatrix,
-            misc: SIMD4<Float>(brightness, pointSize, Float(got), 0)
+            misc: SIMD4<Float>(brightness, pointSize, Float(got), Float(frameCount))
         )
         let uniformsBuffer = uniformsBuffers[writeBufferIndex]
         memcpy(uniformsBuffer.contents(), &uniforms, MemoryLayout<VectorscopeUniforms>.stride)
@@ -206,6 +205,7 @@ final class VectorscopeRenderer: NSObject, MTKViewDelegate {
             compute.setBuffer(rb, offset: 0, index: 1)
             compute.setBuffer(positionsBuffers[writeBufferIndex], offset: 0, index: 2)
             compute.setBuffer(paramsBuffer, offset: 0, index: 3)
+            compute.setBuffer(uniformsBuffer, offset: 0, index: 4)
 
             let threadWidth = computePipeline.threadExecutionWidth
             let threadsPerGroup = MTLSize(width: min(threadWidth, max(1, got)), height: 1, depth: 1)
@@ -237,7 +237,7 @@ final class VectorscopeRenderer: NSObject, MTKViewDelegate {
 // MARK: - Minimal helper to wire up MTKView + renderer
 public final class VectorscopeMTKView: MTKView {
     private var renderer: VectorscopeRenderer?
-    private let audio = StereoAudioSource(maxSamples: 65536)
+    private let audio = StereoAudioSource(maxSamples: 262144)
 
     /// Start with microphone or a file URL
     public func start(source: StereoAudioSource.Source) throws {
@@ -284,8 +284,8 @@ public final class VectorscopeMTKView: MTKView {
 
 private extension simd_float4x4 {
     static func perspective(fovY: Float, aspect: Float, nearZ: Float, farZ: Float) -> simd_float4x4 {
-        let yScale = 1 / tan(fovY * 0.5)
-        let xScale = yScale / max(aspect, 0.0001)
+        let yScale = 1 / tan(fovY * 0.2)
+        let xScale = yScale / max(aspect, 0.001)
         let zRange = farZ - nearZ
         let zScale = -(farZ + nearZ) / zRange
         let wz = -2 * farZ * nearZ / zRange
@@ -297,8 +297,9 @@ private extension simd_float4x4 {
         ))
     }
 
-    init(rotation angle: Float, axis: SIMD3<Float>) {
+    init(rotation angle: Float, axis: SIMD3<Float>, frame: Int) {
         let a = simd_normalize(axis)
+        let f = Float(frame)
         let c = cos(angle)
         let s = sin(angle)
         let t = 1 - c
@@ -311,8 +312,9 @@ private extension simd_float4x4 {
         ))
     }
 
-    init(translation t: SIMD3<Float>) {
+    init(translation t: SIMD3<Float>, frame: Int) {
         self = matrix_identity_float4x4
+        let f = Float(frame)
         self.columns.3 = SIMD4<Float>(t.x, t.y, t.z, 1)
     }
 }
