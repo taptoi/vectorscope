@@ -81,7 +81,7 @@ struct ContentView: View {
                 Spacer()
                 HStack(spacing: 6) {
                     Text("Gain").font(.caption)
-                    Slider(value: Binding(get: { Double(gain) }, set: { gain = Float($0) }), in: 0.1...5.0)
+                    Slider(value: Binding(get: { Double(gain) }, set: { gain = Float($0) }), in: 0.1...20.0)
                         .frame(width: 140)
                 }
                 HStack(spacing: 6) {
