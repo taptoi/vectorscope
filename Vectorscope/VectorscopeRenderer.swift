@@ -6,7 +6,8 @@ import simd
 // MARK: - Uniforms (shared with .metal)
 struct VectorscopeUniforms {
     var viewProjection: simd_float4x4
-    var misc: SIMD4<Float> // x: brightness, y: point size, z: sampleCount, w: unused
+    var misc: SIMD4<Float> // x: brightness, y: line width, z: sampleCount, w: unused
+    var screen: SIMD4<Float> = .zero // x: drawable width, y: drawable height, z/w unused
 }
 
 struct AudioLiftParams {
@@ -37,7 +38,7 @@ final class VectorscopeRenderer: NSObject, MTKViewDelegate {
 
     // State
     var gain: Float = 1.0
-    var pointSize: Float = 2.0
+    var lineWidth: Float = 2.0
     var brightness: Float = 0.9
     private(set) var currentSampleCount: Int = 0
     var zGain: Float = 1.0
@@ -191,7 +192,13 @@ final class VectorscopeRenderer: NSObject, MTKViewDelegate {
 
         var uniforms = VectorscopeUniforms(
             viewProjection: viewProjectionMatrix,
-            misc: SIMD4<Float>(brightness, pointSize, Float(got), 0)
+            misc: SIMD4<Float>(brightness, lineWidth, Float(got), 0)
+        )
+        uniforms.screen = SIMD4<Float>(
+            Float(view.drawableSize.width),
+            Float(view.drawableSize.height),
+            0,
+            0
         )
         let uniformsBuffer = uniformsBuffers[writeBufferIndex]
         memcpy(uniformsBuffer.contents(), &uniforms, MemoryLayout<VectorscopeUniforms>.stride)
@@ -220,7 +227,7 @@ final class VectorscopeRenderer: NSObject, MTKViewDelegate {
         enc.setVertexBuffer(uniformsBuffer, offset: 0, index: 1)
 
         if got >= 2 {
-            enc.drawPrimitives(type: .lineStrip, vertexStart: 0, vertexCount: got)
+            enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: got * 2)
         } else if got == 1 {
             enc.drawPrimitives(type: .point, vertexStart: 0, vertexCount: 1)
         }
@@ -266,9 +273,9 @@ public final class VectorscopeMTKView: MTKView {
         }
     }
 
-    public var pointSize: Float {
-        get { renderer?.pointSize ?? 2.0 }
-        set { renderer?.pointSize = newValue }
+    public var lineWidth: Float {
+        get { renderer?.lineWidth ?? 2.0 }
+        set { renderer?.lineWidth = newValue }
     }
 
     public var brightness: Float {

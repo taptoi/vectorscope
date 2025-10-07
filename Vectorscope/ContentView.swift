@@ -16,7 +16,7 @@ struct VectorscopeView: NSViewRepresentable {
 
     @Binding var source: Source
     @Binding var gain: Float
-    @Binding var pointSize: Float
+    @Binding var lineWidth: Float
     @Binding var brightness: Float
     @Binding var samplesToDraw: Int
 
@@ -56,7 +56,7 @@ struct VectorscopeView: NSViewRepresentable {
 
     private func applyParams(view: VectorscopeMTKView) {
         view.gain = gain
-        view.pointSize = pointSize
+        view.lineWidth = lineWidth
         view.brightness = brightness
         view.samplesToDraw = samplesToDraw
     }
@@ -68,7 +68,7 @@ struct ContentView: View {
     @State private var source: VectorscopeView.Source = .microphone
     #endif
     @State private var gain: Float = 1.2
-    @State private var pointSize: Float = 2.0
+    @State private var lineWidth: Float = 2.0
     @State private var brightness: Float = 0.9
     @State private var samplesToDraw: Int = 65536
 
@@ -85,8 +85,8 @@ struct ContentView: View {
                         .frame(width: 140)
                 }
                 HStack(spacing: 6) {
-                    Text("Point").font(.caption)
-                    Slider(value: Binding(get: { Double(pointSize) }, set: { pointSize = Float($0) }), in: 1.0...8.0)
+                    Text("Line Width").font(.caption)
+                    Slider(value: Binding(get: { Double(lineWidth) }, set: { lineWidth = Float($0) }), in: 1.0...12.0)
                         .frame(width: 120)
                 }
                 HStack(spacing: 6) {
@@ -102,7 +102,7 @@ struct ContentView: View {
             }
             .padding(.horizontal)
 
-            VectorscopeView(source: $source, gain: $gain, pointSize: $pointSize, brightness: $brightness, samplesToDraw: $samplesToDraw)
+            VectorscopeView(source: $source, gain: $gain, lineWidth: $lineWidth, brightness: $brightness, samplesToDraw: $samplesToDraw)
                 .background(Color.black)
             #else
             Text("This demo currently targets macOS.")
