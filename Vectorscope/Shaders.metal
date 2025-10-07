@@ -212,10 +212,10 @@ vertex VSOut vectorscope_lift_vertex(uint vid [[vertex_id]],
         p.z * 0.7f + evolve * 0.18f,
         total * 0.01f + evolve * 0.11f
     );
-    float4 perlin = perlinNoise4(p_in) * 2.0f;
-    float4 out_pos = uniforms.viewProjection * float4(perlin.xyz, 1.0);
+    float4 perlin = perlinNoise4(p_in) * 4.0f;
+    float4 out_pos = uniforms.viewProjection * float4(perlin.xyz, 4.0);
     // shift if out of bounds:
-    // out_pos = fract(out_pos) - float4(0.5);
+    out_pos = fract(out_pos) - float4(0.5);
     float4 minB = float4(-10.0, -10.0, -100.0, -100.0);
     float4 maxB = float4( 10.0,  10.0,  100.0, 100.0);
     out.position = wrapPosition(out_pos, minB, maxB);
