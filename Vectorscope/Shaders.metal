@@ -215,9 +215,9 @@ vertex VSOut vectorscope_lift_vertex(uint vid [[vertex_id]],
     float4 perlin = perlinNoise4(p_in) * 4.0f;
     float4 out_pos = uniforms.viewProjection * float4(perlin.xyz, 4.0);
     // shift if out of bounds:
-    out_pos = fract(out_pos) - float4(0.5);
-    float4 minB = float4(-10.0, -10.0, -100.0, -100.0);
-    float4 maxB = float4( 10.0,  10.0,  100.0, 100.0);
+    //out_pos = fract(out_pos) - float4(0.5);
+    float4 minB = float4(-10, -10, -100.0, -100.0);
+    float4 maxB = float4( 10,  10,  100.0, 100.0);
     out.position = wrapPosition(out_pos, minB, maxB);
     //out.position = out_pos;
     
@@ -289,6 +289,7 @@ fragment float4 line_expand_fragment(FullscreenOut in                 [[stage_in
     float alpha = clamp(mask * uniforms.intensityScale, 0.0, 1.0);
     float3 baseColor = (alphaAccum > 1e-5) ? colorAccum / max(alphaAccum, 1e-5) : float3(0.0);
     float3 finalColor = baseColor * alpha;
+    finalColor = trunc(finalColor) * 1.2;
 
     return float4(finalColor, alpha);
 }

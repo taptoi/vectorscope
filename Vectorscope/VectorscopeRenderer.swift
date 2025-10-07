@@ -352,7 +352,7 @@ public final class VectorscopeMTKView: MTKView {
 
 private extension simd_float4x4 {
     static func perspective(fovY: Float, aspect: Float, nearZ: Float, farZ: Float) -> simd_float4x4 {
-        let yScale = 1 / tan(fovY * 0.3)
+        let yScale = 1 / tan(fovY * 0.1)
         let xScale = yScale / max(aspect, 0.001)
         let zRange = farZ - nearZ
         let zScale = -(farZ + nearZ) / zRange
