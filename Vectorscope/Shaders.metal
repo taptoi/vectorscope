@@ -149,7 +149,9 @@ struct AudioLiftParams {
 
 struct LiftRenderUniforms {
     float4x4 viewProjection;
-    float4   misc; // x: brightness, y: point size, z: sample count, w: unused
+    float4   misc; // x: brightness, y: line width, z: sample count, w: render flag (>0 for lines)
+    float2   viewportSize;
+    float2   pad;
 };
 
 struct VSOut {
@@ -180,32 +182,97 @@ kernel void liftStereoTimeLag(device const float* leftSamples   [[buffer(0)]],
     outXYZ[tid] = lifted;
 }
 
+struct EvaluatedPoint {
+    float3 original;
+    float4 clip;
+};
+
+inline EvaluatedPoint evaluatePoint(uint index,
+                                    constant LiftRenderUniforms& uniforms,
+                                    const device float3* positions,
+                                    float totalSamples) {
+    EvaluatedPoint result;
+    float3 p = positions[index];
+    float4 p_in = float4(p, totalSamples);
+    float4 perlin = perlinNoise4(p_in) * 10.0f;
+    float4 clip = uniforms.viewProjection * float4(perlin.xyz, 1.0);
+    result.original = p;
+    result.clip = clip;
+    return result;
+}
+
 vertex VSOut vectorscope_lift_vertex(uint vid [[vertex_id]],
                                      const device float3* positions [[buffer(0)]],
                                      constant LiftRenderUniforms& uniforms [[buffer(1)]]) {
     VSOut out;
-    float3 p = positions[vid];
-    
-    
+    uint sampleCount = (uint)max(uniforms.misc.z, 0.0);
+    bool renderStrip = (uniforms.misc.w > 0.5f) && (sampleCount >= 2u);
 
-    float total = max(1.0, uniforms.misc.z - 1.0);
-    float age = (total > 0.0) ? float(vid) / total : 0.0;
-    float4 p_in = float4(p, total);
-    float4 perlin = perlinNoise4(p_in) * 10.;
-    float4 out_pos = uniforms.viewProjection * float4(perlin.xyz, 1.0);
-    // shift if out of bounds:
-    out_pos = fract(out_pos) - float4(0.5);
-    out.position = out_pos;
-    
-    float alpha = clamp(uniforms.misc.x * age, 0.0, 1.0);
+    uint sampleIndex = renderStrip ? (vid >> 1) : vid;
+    sampleIndex = min(sampleIndex, sampleCount > 0u ? (sampleCount - 1u) : 0u);
 
-    float depth = clamp(0.5 + 0.5 * tanh(p.z), 0.0, 1.0);
-    float3 cold = float3(0.2, 0.6, 1.0);
-    float3 warm = float3(1.0, 0.4, 0.6);
+    uint prevIndex = (sampleIndex > 0u) ? (sampleIndex - 1u) : sampleIndex;
+    uint nextIndex = (sampleIndex + 1u < sampleCount) ? (sampleIndex + 1u) : sampleIndex;
+
+    float total = max(1.0f, uniforms.misc.z - 1.0f);
+
+    EvaluatedPoint prevEval = evaluatePoint(prevIndex, uniforms, positions, total);
+    EvaluatedPoint currEval = evaluatePoint(sampleIndex, uniforms, positions, total);
+    EvaluatedPoint nextEval = evaluatePoint(nextIndex, uniforms, positions, total);
+
+    float4 clipPrev = prevEval.clip;
+    float4 clipCurr = currEval.clip;
+    float4 clipNext = nextEval.clip;
+
+    float invPrevW = clipPrev.w != 0.0f ? 1.0f / clipPrev.w : 0.0f;
+    float invCurrW = clipCurr.w != 0.0f ? 1.0f / clipCurr.w : 0.0f;
+    float invNextW = clipNext.w != 0.0f ? 1.0f / clipNext.w : 0.0f;
+
+    float2 ndcPrev = clipPrev.xy * invPrevW;
+    float2 ndcCurr = clipCurr.xy * invCurrW;
+    float2 ndcNext = clipNext.xy * invNextW;
+
+    float2 tangent = ndcNext - ndcPrev;
+    float len = length(tangent);
+    if (len > 1e-6f) {
+        tangent /= len;
+    } else {
+        tangent = float2(0.0f, 1.0f);
+    }
+    float2 normal = float2(-tangent.y, tangent.x);
+
+    float halfWidth = max(0.5f, uniforms.misc.y * 0.5f);
+    float2 viewport = uniforms.viewportSize;
+    float2 pixelToNDC = float2(viewport.x > 0.0f ? (2.0f / viewport.x) : 0.0f,
+                               viewport.y > 0.0f ? (2.0f / viewport.y) : 0.0f);
+    float2 offsetNDC = normal * (halfWidth * pixelToNDC);
+
+    if (renderStrip) {
+        offsetNDC = (vid & 1u) == 0u ? -offsetNDC : offsetNDC;
+    } else {
+        offsetNDC = float2(0.0f);
+    }
+
+    float2 extrudedNDC = ndcCurr + offsetNDC;
+    float4 extrudedClip = clipCurr;
+    extrudedClip.x = extrudedNDC.x * clipCurr.w;
+    extrudedClip.y = extrudedNDC.y * clipCurr.w;
+
+    float3 wrapped = fract(extrudedClip.xyz) - float3(0.5f);
+    float4 finalPosition = float4(wrapped, clipCurr.w);
+    out.position = finalPosition;
+
+    float totalForAge = max(1.0f, uniforms.misc.z - 1.0f);
+    float age = (totalForAge > 0.0f) ? float(sampleIndex) / totalForAge : 0.0f;
+    float alpha = clamp(uniforms.misc.x * age, 0.0f, 1.0f);
+
+    float depth = clamp(0.5f + 0.5f * tanh(currEval.original.z), 0.0f, 1.0f);
+    float3 cold = float3(0.2f, 0.6f, 1.0f);
+    float3 warm = float3(1.0f, 0.4f, 0.6f);
     float3 baseColor = mix(cold, warm, depth);
 
     out.color = float4(baseColor, alpha);
-    out.pointSize = max(1.0, uniforms.misc.y);
+    out.pointSize = max(1.0f, uniforms.misc.y);
     return out;
 }
 
